@@ -31,6 +31,8 @@ jobs:
       TARGET_FULL: ${{ github.event.client_payload.full_name }}
       COMMIT_SHA: ${{ github.event.client_payload.commit_sha }}
       PROFILE: ${{ github.event.client_payload.veracode_profile }}
+      APP_GUID: ${{ github.event.client_payload.veracode_app_guid }}
+      POLICY_NAME: ${{ github.event.client_payload.veracode_policy_name }}
       PR_NUMBER: ${{ github.event.client_payload.pr_number }}
       BUSINESS_APP: ${{ github.event.client_payload.business_application }}
     steps:
@@ -77,12 +79,16 @@ jobs:
           fi
           curl -sSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip pipeline-scan.jar
+          # Apply the Veracode policy from the resolved context when provided.
+          policy_arg=()
+          [ -n "${POLICY_NAME}" ] && policy_arg=(--policy_name "${POLICY_NAME}")
           set +e
           java -jar pipeline-scan.jar \
             --veracode_api_id "${VERACODE_API_ID}" \
             --veracode_api_key "${VERACODE_API_KEY}" \
             --file "${ARTIFACT}" \
             --project_name "${PROFILE}" \
+            "${policy_arg[@]}" \
             --json_output_file results.json
           code=$?
           set -e
