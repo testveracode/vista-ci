@@ -30,9 +30,9 @@ jobs:
       TARGET_REPO: ${{ github.event.client_payload.repo }}
       TARGET_FULL: ${{ github.event.client_payload.full_name }}
       COMMIT_SHA: ${{ github.event.client_payload.commit_sha }}
-      PROFILE: ${{ github.event.client_payload.veracode_profile }}
-      APP_GUID: ${{ github.event.client_payload.veracode_app_guid }}
-      POLICY_NAME: ${{ github.event.client_payload.veracode_policy_name }}
+      PROFILE: ${{ github.event.client_payload.veracode.profile }}
+      APP_GUID: ${{ github.event.client_payload.veracode.app_guid }}
+      POLICY_NAME: ${{ github.event.client_payload.veracode.policy_name }}
       PR_NUMBER: ${{ github.event.client_payload.pr_number }}
       BUSINESS_APP: ${{ github.event.client_payload.business_application }}
     steps:
