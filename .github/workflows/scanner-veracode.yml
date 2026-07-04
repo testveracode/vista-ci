@@ -1,0 +1,139 @@
+name: scanner-veracode
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CENTRAL Veracode scanner. Lives ONLY in the central Vista CI repository.
+# Target repos need NO workflow files — the Vista App sends a repository_dispatch
+# event here with the target repo, commit SHA and Veracode profile.
+#
+# This workflow authenticates AS THE GITHUB APP (private key stored as a secret
+# in this central repo), checks out the target repo, runs Veracode Pipeline
+# Scan, then publishes the "Vista Scanner" check and PR comment ON THE TARGET
+# repo (cross-repo, using the minted app token).
+#
+# Required secrets in this central repo:
+#   VISTA_APP_ID, VISTA_APP_PRIVATE_KEY   (the GitHub App credentials)
+#   VERACODE_API_ID, VERACODE_API_KEY     (Veracode credentials)
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  repository_dispatch:
+    types: [vista-scan]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Veracode Pipeline Scan (central)
+    runs-on: ubuntu-latest
+    env:
+      TARGET_OWNER: ${{ github.event.client_payload.owner }}
+      TARGET_REPO: ${{ github.event.client_payload.repo }}
+      TARGET_FULL: ${{ github.event.client_payload.full_name }}
+      COMMIT_SHA: ${{ github.event.client_payload.commit_sha }}
+      PROFILE: ${{ github.event.client_payload.veracode_profile }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+      BUSINESS_APP: ${{ github.event.client_payload.business_application }}
+    steps:
+      - name: Mint App installation token for the target repo
+        id: apptoken
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.VISTA_APP_ID }}
+          private-key: ${{ secrets.VISTA_APP_PRIVATE_KEY }}
+          owner: ${{ github.event.client_payload.owner }}
+          repositories: ${{ github.event.client_payload.repo }}
+
+      - name: Checkout target repo @ commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_FULL }}
+          ref: ${{ env.COMMIT_SHA }}
+          token: ${{ steps.apptoken.outputs.token }}
+          path: target
+
+      - name: Build artifact
+        id: build
+        working-directory: target
+        run: |
+          set -euo pipefail
+          # Project-specific packaging of the target repo.
+          #   e.g. npm ci && npm run build && zip -r ../veracode-artifact.zip dist package.json
+          echo "Package target artifact here (project-specific)."
+          echo "artifact=${GITHUB_WORKSPACE}/veracode-artifact.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Run Veracode Pipeline Scan
+        id: scan
+        continue-on-error: true
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROFILE}" ]; then
+            echo "scanner_status=error" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Veracode profile in payload; scan skipped."
+            exit 0
+          fi
+          curl -sSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -o pipeline-scan-LATEST.zip pipeline-scan.jar
+          set +e
+          java -jar pipeline-scan.jar \
+            --veracode_api_id "${VERACODE_API_ID}" \
+            --veracode_api_key "${VERACODE_API_KEY}" \
+            --file "${ARTIFACT}" \
+            --project_name "${PROFILE}" \
+            --json_output_file results.json
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "scanner_status=passed" >> "$GITHUB_OUTPUT"
+          else
+            echo "scanner_status=failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish Vista Scanner check on target repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.apptoken.outputs.token }}
+          script: |
+            const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
+            const conclusion = status === 'passed' ? 'success'
+              : status === 'failed' ? 'failure' : 'neutral';
+            await github.rest.checks.create({
+              owner: process.env.TARGET_OWNER,
+              repo: process.env.TARGET_REPO,
+              name: 'Vista Scanner',
+              head_sha: process.env.COMMIT_SHA,
+              status: 'completed',
+              conclusion,
+              output: {
+                title: `Veracode ${status}`,
+                summary: `Veracode Pipeline Scan result: **${status}** (profile: ${process.env.PROFILE}).`,
+              },
+            });
+
+      - name: Update Vista PR comment on target repo
+        if: ${{ env.PR_NUMBER != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.apptoken.outputs.token }}
+          script: |
+            const marker = '<!-- fortiminds-vista -->';
+            const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
+            const icon = status === 'passed' ? '✅' : status === 'failed' ? '❌' : '⚠️';
+            const scannerLine = `${icon} **Scanner** — Veracode Pipeline Scan: **${status}**`;
+            const owner = process.env.TARGET_OWNER, repo = process.env.TARGET_REPO;
+            const pr = Number(process.env.PR_NUMBER);
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: pr, per_page: 100,
+            });
+            const prior = comments.find(c => c.body && c.body.includes(marker));
+            if (prior) {
+              const body = prior.body.replace(/(⏳|➖|⛔|✅|❌|⚠️) \*\*Scanner\*\*.*$/s, scannerLine);
+              await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr, body: `${marker}\n${scannerLine}`,
+              });
+            }
