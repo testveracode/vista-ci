@@ -164,9 +164,23 @@ jobs:
           fi
           curl -sSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip pipeline-scan.jar
-          # Apply the Veracode policy from the resolved context when provided.
+          # A custom org policy is not a built-in and must be FETCHED first via
+          # --request_policy, which writes "<Policy Name>.json". Then it is
+          # applied with --policy_file. If the fetch fails, scan without policy
+          # gating rather than erroring the whole scan.
           policy_arg=()
-          [ -n "${POLICY_NAME}" ] && policy_arg=(--policy_name "${POLICY_NAME}")
+          if [ -n "${POLICY_NAME}" ]; then
+            if java -jar pipeline-scan.jar \
+                 --veracode_api_id "${VERACODE_API_ID}" \
+                 --veracode_api_key "${VERACODE_API_KEY}" \
+                 --request_policy "${POLICY_NAME}"; then
+              pf="$(ls -1 -- *.json 2>/dev/null | grep -iv '^results.json$' | head -n1 || true)"
+              [ -n "${pf}" ] && policy_arg=(--policy_file "${pf}") \
+                && echo "Using fetched policy file: ${pf}"
+            else
+              echo "::warning::Could not fetch policy '${POLICY_NAME}'; scanning without policy gating."
+            fi
+          fi
           set +e
           java -jar pipeline-scan.jar \
             --veracode_api_id "${VERACODE_API_ID}" \
