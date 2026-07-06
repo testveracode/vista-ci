@@ -99,6 +99,7 @@ jobs:
 
       - name: Build artifact
         id: build
+        continue-on-error: true
         working-directory: target
         env:
           STACK: ${{ steps.detect.outputs.stack }}
@@ -108,10 +109,21 @@ jobs:
           artifact=""
           case "$STACK" in
             maven)
-              mvn -B -ntp clean package -DskipTests
-              # Maven output dir is target/ relative to the checkout (cwd).
+              # Skip formatting/verification plugins that commonly break on a
+              # detached CI checkout (spotless git-ratchet, checkstyle, pmd,
+              # enforcer). We only need compiled bytecode for Veracode.
+              mvn -B -ntp clean package -DskipTests \
+                -Dspotless.check.skip=true -Dspotless.apply.skip=true \
+                -Dcheckstyle.skip=true -Dpmd.skip=true -Denforcer.skip=true \
+                -Dmaven.test.skip=true || echo "::warning::mvn package failed; will try compiled classes."
               f="$(ls -1 target/*.war target/*.jar 2>/dev/null | head -n1 || true)"
-              [ -n "$f" ] && artifact="$(pwd)/$f"
+              if [ -n "$f" ]; then
+                artifact="$(pwd)/$f"
+              elif [ -d target/classes ]; then
+                # Fallback: package compiled classes (Veracode scans bytecode).
+                ( cd target && zip -q -r "${OUT}.zip" classes )
+                artifact="${OUT}.zip"
+              fi
               ;;
             gradle)
               chmod +x ./gradlew 2>/dev/null || true
@@ -150,6 +162,7 @@ jobs:
 
       - name: Run Veracode Pipeline Scan
         id: scan
+        if: always()
         continue-on-error: true
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
@@ -160,6 +173,11 @@ jobs:
           if [ -z "${PROFILE}" ]; then
             echo "scanner_status=error" >> "$GITHUB_OUTPUT"
             echo "::warning::No Veracode profile in payload; scan skipped."
+            exit 0
+          fi
+          if [ -z "${ARTIFACT}" ] || [ ! -f "${ARTIFACT}" ]; then
+            echo "scanner_status=error" >> "$GITHUB_OUTPUT"
+            echo "::warning::No build artifact produced; scan skipped."
             exit 0
           fi
           curl -sSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
@@ -198,6 +216,7 @@ jobs:
           fi
 
       - name: Publish Vista Scanner check on target repo
+        if: always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.apptoken.outputs.token }}
