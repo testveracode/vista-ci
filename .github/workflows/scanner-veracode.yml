@@ -38,6 +38,8 @@ jobs:
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       # Veracode platform base for the application-profile deep link.
       VERACODE_PLATFORM_BASE: https://app.veracode.com
+      # Scan mode: pipeline | sandbox | both (default pipeline).
+      MODE: ${{ github.event.client_payload.veracode.mode || 'pipeline' }}
     steps:
       - name: Mint App installation token for the target repo
         id: apptoken
@@ -165,7 +167,7 @@ jobs:
 
       - name: Run Veracode Pipeline Scan
         id: scan
-        if: always()
+        if: ${{ always() && (env.MODE == 'pipeline' || env.MODE == 'both') }}
         continue-on-error: true
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
@@ -218,6 +220,26 @@ jobs:
             echo "scanner_status=failed" >> "$GITHUB_OUTPUT"
           fi
 
+      # Sandbox (policy) scan: uploads to the Veracode platform so findings are
+      # stored under the application profile with a real platform deep link.
+      # Async — submitted fire-and-forget (scantimeout 0); results appear on the
+      # platform after the scan completes.
+      - name: Submit Veracode Sandbox scan
+        id: sandbox
+        if: ${{ always() && (env.MODE == 'sandbox' || env.MODE == 'both') && steps.build.outputs.artifact != '' }}
+        continue-on-error: true
+        uses: veracode/veracode-uploadandscan-action@0.2.6
+        with:
+          appname: ${{ env.PROFILE }}
+          version: vista-${{ env.COMMIT_SHA }}
+          filepath: ${{ steps.build.outputs.artifact }}
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+          createprofile: false
+          createsandbox: true
+          sandboxname: vista-pr-${{ env.PR_NUMBER }}
+          scantimeout: 0
+
       - name: Upload Veracode results
         if: always()
         uses: actions/upload-artifact@v4
@@ -249,10 +271,26 @@ jobs:
                 return { total: items.length, line, table };
               } catch { return { total: 0, line: 'results unavailable', table: '' }; }
             }
-            const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
-            const conclusion = status === 'passed' ? 'success'
-              : status === 'failed' ? 'failure' : 'neutral';
+            const mode = process.env.MODE || 'pipeline';
+            const sandboxRan = mode === 'sandbox' || mode === 'both';
+            const sandboxOk = '${{ steps.sandbox.outcome }}' === 'success';
+            const pipeStatus = '${{ steps.scan.outputs.scanner_status }}';
+            let status, conclusion;
+            if (mode === 'sandbox') {
+              status = sandboxOk ? 'submitted' : 'error';
+              conclusion = 'neutral';
+            } else {
+              status = pipeStatus || 'error';
+              conclusion = status === 'passed' ? 'success' : status === 'failed' ? 'failure' : 'neutral';
+            }
             const s = summarize();
+            const profileLink = process.env.APP_GUID
+              ? ` · [🔗 Veracode profile](${process.env.VERACODE_PLATFORM_BASE}/applications/${process.env.APP_GUID})` : '';
+            const sandboxLine = sandboxRan
+              ? `\n\n🔬 Sandbox scan ${sandboxOk ? 'submitted' : 'FAILED to submit'} to Veracode platform (sandbox \`vista-pr-${process.env.PR_NUMBER}\`). Results appear on the profile.`
+              : '';
+            const pipeLine = (mode !== 'sandbox')
+              ? `Pipeline Scan **${status}** against policy _${process.env.POLICY_NAME||'default'}_.\nFindings: ${s.line}` : '';
             await github.rest.checks.create({
               owner: process.env.TARGET_OWNER,
               repo: process.env.TARGET_REPO,
@@ -261,9 +299,9 @@ jobs:
               status: 'completed',
               conclusion,
               output: {
-                title: `Veracode ${status} — ${s.total} finding(s)`,
-                summary: `Veracode Pipeline Scan **${status}** against policy _${process.env.POLICY_NAME||'default'}_.\n\nProfile: \`${process.env.PROFILE}\`\nFindings: ${s.line}\n\n[📋 Full scan run](${process.env.RUN_URL})` + (process.env.APP_GUID?` · [🔗 Veracode profile](${process.env.VERACODE_PLATFORM_BASE}/applications/${process.env.APP_GUID})`:''),
-                text: `## Veracode findings (${s.total})${s.table}`,
+                title: `Veracode ${status} (${mode})${mode !== 'sandbox' ? ` — ${s.total} finding(s)` : ''}`,
+                summary: `Profile: \`${process.env.PROFILE}\`\n${pipeLine}${sandboxLine}\n\n[📋 Full scan run](${process.env.RUN_URL})${profileLink}`,
+                text: mode !== 'sandbox' ? `## Veracode findings (${s.total})${s.table}` : 'Sandbox scan submitted to the Veracode platform.',
               },
             });
 
@@ -306,10 +344,19 @@ jobs:
               (guid ? ` · [🔗 Veracode profile](${base}/applications/${guid})` : '');
 
             const marker = '<!-- fortiminds-vista -->';
-            const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
-            const icon = status === 'passed' ? '✅' : status === 'failed' ? '❌' : '⚠️';
-            const scannerLine =
-              `${icon} **Scanner** — Veracode Pipeline Scan: **${status}** — ${total} finding(s): ${line}${detail}${links}`;
+            const mode = process.env.MODE || 'pipeline';
+            const sandboxRan = mode === 'sandbox' || mode === 'both';
+            const sandboxOk = '${{ steps.sandbox.outcome }}' === 'success';
+            const pipeStatus = '${{ steps.scan.outputs.scanner_status }}';
+            const status = mode === 'sandbox' ? (sandboxOk ? 'submitted' : 'error') : (pipeStatus || 'error');
+            const icon = status === 'passed' ? '✅' : status === 'failed' ? '❌'
+              : status === 'submitted' ? '🔬' : '⚠️';
+            const sandboxNote = sandboxRan
+              ? `\n\n🔬 Sandbox scan ${sandboxOk ? 'submitted' : '**failed to submit**'} to Veracode platform (sandbox \`vista-pr-${process.env.PR_NUMBER}\`) — results appear on the profile.`
+              : '';
+            const scannerLine = mode === 'sandbox'
+              ? `${icon} **Scanner** — Veracode Sandbox scan **${sandboxOk ? 'submitted' : 'failed to submit'}** to platform${links}`
+              : `${icon} **Scanner** — Veracode Pipeline Scan: **${status}** — ${total} finding(s): ${line}${detail}${sandboxNote}${links}`;
             const owner = process.env.TARGET_OWNER, repo = process.env.TARGET_REPO;
             const pr = Number(process.env.PR_NUMBER);
             const { data: comments } = await github.rest.issues.listComments({
