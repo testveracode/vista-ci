@@ -53,15 +53,100 @@ jobs:
           token: ${{ steps.apptoken.outputs.token }}
           path: target
 
-      - name: Build artifact
-        id: build
+      # ── Auto-detect the target repo's stack so one central workflow can scan
+      #    repositories of any language. Detection drives which toolchain is set
+      #    up and how the Veracode-uploadable artifact is produced.
+      - name: Detect stack
+        id: detect
         working-directory: target
         run: |
           set -euo pipefail
-          # Project-specific packaging of the target repo.
-          #   e.g. npm ci && npm run build && zip -r ../veracode-artifact.zip dist package.json
-          echo "Package target artifact here (project-specific)."
-          echo "artifact=${GITHUB_WORKSPACE}/veracode-artifact.zip" >> "$GITHUB_OUTPUT"
+          if   [ -f pom.xml ]; then stack=maven
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then stack=gradle
+          elif [ -f package.json ]; then stack=node
+          elif ls ./*.sln >/dev/null 2>&1 || ls ./*.csproj >/dev/null 2>&1; then stack=dotnet
+          elif [ -f go.mod ]; then stack=go
+          elif [ -f requirements.txt ] || [ -f setup.py ] || [ -f pyproject.toml ]; then stack=python
+          else stack=source
+          fi
+          echo "stack=$stack" >> "$GITHUB_OUTPUT"
+          echo "Detected stack: $stack"
+
+      - name: Setup JDK
+        if: steps.detect.outputs.stack == 'maven' || steps.detect.outputs.stack == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Node
+        if: steps.detect.outputs.stack == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup .NET
+        if: steps.detect.outputs.stack == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'
+
+      - name: Setup Go
+        if: steps.detect.outputs.stack == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build artifact
+        id: build
+        working-directory: target
+        env:
+          STACK: ${{ steps.detect.outputs.stack }}
+        run: |
+          set -euo pipefail
+          OUT="${GITHUB_WORKSPACE}/veracode-artifact"
+          artifact=""
+          case "$STACK" in
+            maven)
+              mvn -B -ntp clean package -DskipTests
+              # Maven output dir is target/ relative to the checkout (cwd).
+              f="$(ls -1 target/*.war target/*.jar 2>/dev/null | head -n1 || true)"
+              [ -n "$f" ] && artifact="$(pwd)/$f"
+              ;;
+            gradle)
+              chmod +x ./gradlew 2>/dev/null || true
+              (./gradlew build -x test || gradle build -x test)
+              artifact="$(pwd)/$(ls -1 build/libs/*.war build/libs/*.jar 2>/dev/null | head -n1)"
+              ;;
+            node)
+              npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+              if node -e "process.exit(require('./package.json').scripts?.build?0:1)"; then npm run build || true; fi
+              zip -q -r "${OUT}.zip" . -x '.git/*'
+              artifact="${OUT}.zip"
+              ;;
+            dotnet)
+              dotnet build -c Release
+              zip -q -r "${OUT}.zip" . -x '.git/*'
+              artifact="${OUT}.zip"
+              ;;
+            go)
+              go build ./... || true
+              zip -q -r "${OUT}.zip" . -x '.git/*'
+              artifact="${OUT}.zip"
+              ;;
+            *)
+              # python / unknown: Veracode accepts a source archive for many langs.
+              zip -q -r "${OUT}.zip" . -x '.git/*'
+              artifact="${OUT}.zip"
+              ;;
+          esac
+          if [ -z "${artifact}" ] || [ ! -f "${artifact}" ]; then
+            echo "::warning::No compiled artifact found for stack '${STACK}'; falling back to source zip."
+            zip -q -r "${OUT}.zip" . -x '.git/*'
+            artifact="${OUT}.zip"
+          fi
+          echo "Artifact: ${artifact} ($(du -h "${artifact}" | cut -f1))"
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
 
       - name: Run Veracode Pipeline Scan
         id: scan
