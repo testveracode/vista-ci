@@ -222,23 +222,36 @@ jobs:
 
       # Sandbox (policy) scan: uploads to the Veracode platform so findings are
       # stored under the application profile with a real platform deep link.
-      # Async — submitted fire-and-forget (scantimeout 0); results appear on the
+      # Uses the Veracode Java API wrapper directly (no Docker action). Async —
+      # submitted fire-and-forget (scantimeout 0); results appear on the
       # platform after the scan completes.
       - name: Submit Veracode Sandbox scan
         id: sandbox
         if: ${{ always() && (env.MODE == 'sandbox' || env.MODE == 'both') && steps.build.outputs.artifact != '' }}
         continue-on-error: true
-        uses: veracode/veracode-uploadandscan-action@0.2.6
-        with:
-          appname: ${{ env.PROFILE }}
-          version: vista-${{ env.COMMIT_SHA }}
-          filepath: ${{ steps.build.outputs.artifact }}
-          vid: ${{ secrets.VERACODE_API_ID }}
-          vkey: ${{ secrets.VERACODE_API_KEY }}
-          createprofile: false
-          createsandbox: true
-          sandboxname: vista-pr-${{ env.PR_NUMBER }}
-          scantimeout: 0
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          base="https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java"
+          ver="$(curl -sf "${base}/maven-metadata.xml" | grep -oE '<latest>[^<]+' | sed 's/<latest>//' | head -n1)"
+          ver="${ver:-24.10.15.0}"
+          echo "Veracode Java API wrapper ${ver}"
+          curl -sSL -o veracode-wrapper.jar "${base}/${ver}/vosp-api-wrappers-java-${ver}.jar"
+          sandbox="vista-pr-${PR_NUMBER:-manual}"
+          java -jar veracode-wrapper.jar \
+            -vid "${VERACODE_API_ID}" -vkey "${VERACODE_API_KEY}" \
+            -action uploadandscan \
+            -appname "${PROFILE}" \
+            -createprofile false \
+            -createsandbox true \
+            -sandboxname "${sandbox}" \
+            -version "vista-${COMMIT_SHA}" \
+            -filepath "${ARTIFACT}" \
+            -scantimeout 0
+          echo "Sandbox scan submitted to profile '${PROFILE}' sandbox '${sandbox}'."
 
       - name: Upload Veracode results
         if: always()
