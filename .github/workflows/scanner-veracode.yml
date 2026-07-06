@@ -35,6 +35,9 @@ jobs:
       POLICY_NAME: ${{ github.event.client_payload.veracode.policy_name }}
       PR_NUMBER: ${{ github.event.client_payload.pr_number }}
       BUSINESS_APP: ${{ github.event.client_payload.business_application }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # Veracode platform base for the application-profile deep link.
+      VERACODE_PLATFORM_BASE: https://app.veracode.com
     steps:
       - name: Mint App installation token for the target repo
         id: apptoken
@@ -215,6 +218,14 @@ jobs:
             echo "scanner_status=failed" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Upload Veracode results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-results
+          path: results.json
+          if-no-files-found: ignore
+
       - name: Publish Vista Scanner check on target repo
         if: always()
         uses: actions/github-script@v7
@@ -251,7 +262,7 @@ jobs:
               conclusion,
               output: {
                 title: `Veracode ${status} — ${s.total} finding(s)`,
-                summary: `Veracode Pipeline Scan **${status}** against policy _${process.env.POLICY_NAME||'default'}_.\n\nProfile: \`${process.env.PROFILE}\`\nFindings: ${s.line}`,
+                summary: `Veracode Pipeline Scan **${status}** against policy _${process.env.POLICY_NAME||'default'}_.\n\nProfile: \`${process.env.PROFILE}\`\nFindings: ${s.line}\n\n[📋 Full scan run](${process.env.RUN_URL})` + (process.env.APP_GUID?` · [🔗 Veracode profile](${process.env.VERACODE_PLATFORM_BASE}/applications/${process.env.APP_GUID})`:''),
                 text: `## Veracode findings (${s.total})${s.table}`,
               },
             });
@@ -264,20 +275,41 @@ jobs:
           script: |
             const fs = require('fs');
             const SEV = {5:'Very High',4:'High',3:'Medium',2:'Low',1:'Very Low',0:'Informational'};
-            let total = 0, line = 'no findings';
-            try {
-              const items = (JSON.parse(fs.readFileSync('results.json','utf8')).findings)||[];
-              total = items.length;
-              const counts = {};
-              items.forEach(f => counts[f.severity] = (counts[f.severity]||0)+1);
-              line = Object.keys(counts).map(Number).sort((a,b)=>b-a)
-                .map(sv=>`${counts[sv]} ${SEV[sv]??sv}`).join(', ') || 'no findings';
-            } catch {}
+            let items = [];
+            try { items = (JSON.parse(fs.readFileSync('results.json','utf8')).findings) || []; } catch {}
+            const total = items.length;
+            const counts = {};
+            items.forEach(f => counts[f.severity] = (counts[f.severity]||0)+1);
+            const line = Object.keys(counts).map(Number).sort((a,b)=>b-a)
+              .map(sv=>`${counts[sv]} ${SEV[sv]??sv}`).join(', ') || 'no findings';
+
+            const loc = (f) => {
+              const sf = f.files?.source_file || {};
+              return sf.file ? `\`${sf.file}${sf.line?(':'+sf.line):''}\`` : '—';
+            };
+            // Detail the High + Very High findings (the policy-gating ones).
+            const severe = items.filter(f => f.severity >= 4)
+              .sort((a,b)=>b.severity-a.severity).slice(0, 25);
+            const detail = severe.length
+              ? '\n\n<details><summary>High &amp; Very High findings (' + severe.length + ')</summary>\n\n' +
+                '| Severity | Issue | CWE | Location |\n| --- | --- | --- | --- |\n' +
+                severe.map(f => `| ${SEV[f.severity]??f.severity} | ${(f.issue_type||f.title||'').replace(/\|/g,'/')} | ${f.cwe_id?('CWE-'+f.cwe_id):'—'} | ${loc(f)} |`).join('\n') +
+                '\n\n</details>'
+              : '';
+
+            // Links: the scan run always has full results; the Veracode app
+            // profile is a best-effort deep link by GUID.
+            const runUrl = process.env.RUN_URL;
+            const guid = process.env.APP_GUID;
+            const base = process.env.VERACODE_PLATFORM_BASE;
+            const links = `\n\n[📋 Full scan run](${runUrl})` +
+              (guid ? ` · [🔗 Veracode profile](${base}/applications/${guid})` : '');
+
             const marker = '<!-- fortiminds-vista -->';
             const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
             const icon = status === 'passed' ? '✅' : status === 'failed' ? '❌' : '⚠️';
             const scannerLine =
-              `${icon} **Scanner** — Veracode Pipeline Scan: **${status}** — ${total} finding(s): ${line}`;
+              `${icon} **Scanner** — Veracode Pipeline Scan: **${status}** — ${total} finding(s): ${line}${detail}${links}`;
             const owner = process.env.TARGET_OWNER, repo = process.env.TARGET_REPO;
             const pr = Number(process.env.PR_NUMBER);
             const { data: comments } = await github.rest.issues.listComments({
