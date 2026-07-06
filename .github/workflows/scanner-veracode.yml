@@ -221,9 +221,27 @@ jobs:
         with:
           github-token: ${{ steps.apptoken.outputs.token }}
           script: |
+            const fs = require('fs');
+            const SEV = {5:'Very High',4:'High',3:'Medium',2:'Low',1:'Very Low',0:'Informational'};
+            function summarize() {
+              try {
+                const r = JSON.parse(fs.readFileSync('results.json','utf8'));
+                const items = r.findings || [];
+                const counts = {};
+                items.forEach(f => counts[f.severity] = (counts[f.severity]||0)+1);
+                const order = Object.keys(counts).map(Number).sort((a,b)=>b-a);
+                const line = order.map(s=>`${counts[s]} ${SEV[s]??s}`).join(', ') || 'no findings';
+                const rows = items.slice(0,20).map(f =>
+                  `| ${SEV[f.severity]??f.severity} | ${(f.issue_type||f.title||'').replace(/\|/g,'/')} | ${f.files?.source_file?.file||'—'}:${f.files?.source_file?.line??''} |`).join('\n');
+                const table = items.length
+                  ? `\n\n| Severity | Issue | Location |\n| --- | --- | --- |\n${rows}` : '';
+                return { total: items.length, line, table };
+              } catch { return { total: 0, line: 'results unavailable', table: '' }; }
+            }
             const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
             const conclusion = status === 'passed' ? 'success'
               : status === 'failed' ? 'failure' : 'neutral';
+            const s = summarize();
             await github.rest.checks.create({
               owner: process.env.TARGET_OWNER,
               repo: process.env.TARGET_REPO,
@@ -232,8 +250,9 @@ jobs:
               status: 'completed',
               conclusion,
               output: {
-                title: `Veracode ${status}`,
-                summary: `Veracode Pipeline Scan result: **${status}** (profile: ${process.env.PROFILE}).`,
+                title: `Veracode ${status} — ${s.total} finding(s)`,
+                summary: `Veracode Pipeline Scan **${status}** against policy _${process.env.POLICY_NAME||'default'}_.\n\nProfile: \`${process.env.PROFILE}\`\nFindings: ${s.line}`,
+                text: `## Veracode findings (${s.total})${s.table}`,
               },
             });
 
@@ -243,10 +262,22 @@ jobs:
         with:
           github-token: ${{ steps.apptoken.outputs.token }}
           script: |
+            const fs = require('fs');
+            const SEV = {5:'Very High',4:'High',3:'Medium',2:'Low',1:'Very Low',0:'Informational'};
+            let total = 0, line = 'no findings';
+            try {
+              const items = (JSON.parse(fs.readFileSync('results.json','utf8')).findings)||[];
+              total = items.length;
+              const counts = {};
+              items.forEach(f => counts[f.severity] = (counts[f.severity]||0)+1);
+              line = Object.keys(counts).map(Number).sort((a,b)=>b-a)
+                .map(sv=>`${counts[sv]} ${SEV[sv]??sv}`).join(', ') || 'no findings';
+            } catch {}
             const marker = '<!-- fortiminds-vista -->';
             const status = '${{ steps.scan.outputs.scanner_status }}' || 'error';
             const icon = status === 'passed' ? '✅' : status === 'failed' ? '❌' : '⚠️';
-            const scannerLine = `${icon} **Scanner** — Veracode Pipeline Scan: **${status}**`;
+            const scannerLine =
+              `${icon} **Scanner** — Veracode Pipeline Scan: **${status}** — ${total} finding(s): ${line}`;
             const owner = process.env.TARGET_OWNER, repo = process.env.TARGET_REPO;
             const pr = Number(process.env.PR_NUMBER);
             const { data: comments } = await github.rest.issues.listComments({
